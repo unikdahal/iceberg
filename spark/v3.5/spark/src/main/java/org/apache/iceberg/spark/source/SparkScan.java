@@ -279,9 +279,21 @@ abstract class SparkScan implements Scan, SupportsReportStatistics {
         table(), branch(), Spark3Util.describe(filterExpressions), groupingKeyFieldNamesAsString);
   }
 
+  /**
+   * The {@link ScanReport} produced by planning this scan, if planning has happened yet.
+   *
+   * <p>Populated the first time this scan's tasks are planned (see {@link
+   * SparkPartitioningAwareScan#tasks()}) and stable afterwards: unlike re-reading the table's live
+   * state, this reflects the snapshot that was actually resolved and planned against, not whatever
+   * is current at the time this is called. Returns {@code null} if planning has not happened yet.
+   */
+  protected ScanReport scanReport() {
+    return scanReportSupplier != null ? scanReportSupplier.get() : null;
+  }
+
   @Override
   public CustomTaskMetric[] reportDriverMetrics() {
-    ScanReport scanReport = scanReportSupplier != null ? scanReportSupplier.get() : null;
+    ScanReport scanReport = scanReport();
 
     if (scanReport == null) {
       return new CustomTaskMetric[0];

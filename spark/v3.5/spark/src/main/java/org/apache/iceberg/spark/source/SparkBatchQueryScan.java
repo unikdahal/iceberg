@@ -63,7 +63,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 class SparkBatchQueryScan extends SparkPartitioningAwareScan<PartitionScanTask>
-    implements SupportsRuntimeV2Filtering {
+    implements SupportsRuntimeV2Filtering, SupportsSnapshotId {
 
   private static final Logger LOG = LoggerFactory.getLogger(SparkBatchQueryScan.class);
 
@@ -92,8 +92,25 @@ class SparkBatchQueryScan extends SparkPartitioningAwareScan<PartitionScanTask>
     this.runtimeFilterExpressions = Lists.newArrayList();
   }
 
-  Long snapshotId() {
+  @Override
+  public Long snapshotId() {
     return snapshotId;
+  }
+
+  @Override
+  public Long resolvedSnapshotId() {
+    if (snapshotId != null) {
+      // an explicitly pinned read (VERSION AS OF / snapshot-id option): the requested id is the
+      // resolved id, no planning needed to know it
+      return snapshotId;
+    }
+
+    // an unpinned read: the snapshot actually planned against is only known once planning has
+    // happened. Report the id that planning resolved and fixed, not table().currentSnapshot(),
+    // which keeps tracking the table's live state and can have moved on by the time this is
+    // called.
+    ScanReport report = scanReport();
+    return report != null ? report.snapshotId() : null;
   }
 
   @Override
