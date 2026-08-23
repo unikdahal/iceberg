@@ -19,6 +19,8 @@
 package org.apache.iceberg.spark.source;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -59,6 +61,8 @@ import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.spark.sql.connector.catalog.SupportsDeleteV2;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
+import org.apache.spark.sql.connector.catalog.SupportsRecoveryAnchor;
+import org.apache.spark.sql.connector.catalog.SupportsRecoveryWrite;
 import org.apache.spark.sql.connector.catalog.SupportsRowLevelOperations;
 import org.apache.spark.sql.connector.catalog.SupportsWrite;
 import org.apache.spark.sql.connector.catalog.TableCapability;
@@ -80,7 +84,12 @@ import org.slf4j.LoggerFactory;
  * <p>Note the table state (e.g. schema, snapshot) is pinned upon loading and must not change.
  */
 public class SparkTable extends BaseSparkTable
-    implements SupportsRead, SupportsWrite, SupportsDeleteV2, SupportsRowLevelOperations {
+    implements SupportsRead,
+        SupportsWrite,
+        SupportsDeleteV2,
+        SupportsRowLevelOperations,
+        SupportsRecoveryAnchor,
+        SupportsRecoveryWrite {
 
   private static final Logger LOG = LoggerFactory.getLogger(SparkTable.class);
 
@@ -151,6 +160,86 @@ public class SparkTable extends BaseSparkTable
   @Override
   public String version() {
     return String.format("branch_%s_snapshot_%s", branch, snapshotId());
+  }
+
+  @Override
+  public String recoverySourceId() {
+    return "iceberg:v1:" + id() + ":" + encodedRecoverySelector();
+  }
+
+  @Override
+  public String recoverySinkId() {
+    return "iceberg-write:v1:" + id() + ":" + encodedRecoverySelector();
+  }
+
+  private String encodedRecoverySelector() {
+    String selector;
+    if (branch != null) {
+      selector = "branch:" + branch;
+    } else if (timeTravel instanceof AsOfVersion asOfVersion) {
+      selector = "version:" + asOfVersion.version();
+    } else if (timeTravel instanceof AsOfTimestamp asOfTimestamp) {
+      selector = "timestamp-micros:" + asOfTimestamp.timestampMicros();
+    } else {
+      selector = "main";
+    }
+
+    return Base64.getUrlEncoder()
+        .withoutPadding()
+        .encodeToString(selector.getBytes(StandardCharsets.UTF_8));
+  }
+
+  @Override
+  public String currentRecoveryAnchor() {
+    if (snapshot != null) {
+      return String.format("v1:snapshot:%d:schema:%d", snapshot.snapshotId(), schema.schemaId());
+    }
+
+    return String.format("v1:empty:schema:%d", schema.schemaId());
+  }
+
+  @Override
+  public org.apache.spark.sql.connector.catalog.Table withRecoveryAnchor(String anchor) {
+    Preconditions.checkArgument(anchor != null, "Invalid null Iceberg recovery anchor");
+
+    String[] parts = anchor.split(":", -1);
+    Preconditions.checkArgument(
+        parts.length >= 4 && "v1".equals(parts[0]), "Invalid Iceberg recovery anchor: %s", anchor);
+
+    final long anchoredSnapshotId;
+    final int anchoredSchemaId;
+    try {
+      if (parts.length == 5 && "snapshot".equals(parts[1]) && "schema".equals(parts[3])) {
+        anchoredSnapshotId = Long.parseLong(parts[2]);
+        anchoredSchemaId = Integer.parseInt(parts[4]);
+      } else if (parts.length == 4 && "empty".equals(parts[1]) && "schema".equals(parts[2])) {
+        anchoredSnapshotId = -1L;
+        anchoredSchemaId = Integer.parseInt(parts[3]);
+      } else {
+        throw new IllegalArgumentException("Invalid Iceberg recovery anchor: " + anchor);
+      }
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException("Invalid Iceberg recovery anchor: " + anchor, e);
+    }
+
+    Schema anchoredSchema = table().schemas().get(anchoredSchemaId);
+    ValidationException.check(
+        anchoredSchema != null,
+        "Cannot recover Iceberg schema ID %s for table %s",
+        anchoredSchemaId,
+        table().name());
+
+    Snapshot anchoredSnapshot = null;
+    if (anchoredSnapshotId >= 0) {
+      anchoredSnapshot = table().snapshot(anchoredSnapshotId);
+      ValidationException.check(
+          anchoredSnapshot != null,
+          "Cannot recover expired Iceberg snapshot ID %s for table %s",
+          anchoredSnapshotId,
+          table().name());
+    }
+
+    return new SparkTable(table(), anchoredSchema, anchoredSnapshot, branch, timeTravel);
   }
 
   @Override

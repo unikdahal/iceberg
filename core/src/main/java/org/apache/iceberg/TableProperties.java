@@ -98,6 +98,17 @@ public class TableProperties {
   public static final String COMMIT_TOTAL_RETRY_TIME_MS = "commit.retry.total-timeout-ms";
   public static final int COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT = 30 * 60 * 1000; // 30 minutes
 
+  /** Prefix reserved for catalog-atomic snapshot-update idempotency ledger entries. */
+  public static final String COMMIT_IDEMPOTENCY_ENTRY_PREFIX = "commit.idempotency.entry.";
+
+  public static final String COMMIT_IDEMPOTENCY_MAX_ENTRIES =
+      "commit.idempotency.max-entries";
+  public static final int COMMIT_IDEMPOTENCY_MAX_ENTRIES_DEFAULT = 10_000;
+
+  public static final String COMMIT_IDEMPOTENCY_RETENTION_MS =
+      "commit.idempotency.retention-ms";
+  public static final long COMMIT_IDEMPOTENCY_RETENTION_MS_DEFAULT = 7L * 24 * 60 * 60 * 1000;
+
   public static final String COMMIT_NUM_STATUS_CHECKS = "commit.status-check.num-retries";
   public static final int COMMIT_NUM_STATUS_CHECKS_DEFAULT = 3;
 

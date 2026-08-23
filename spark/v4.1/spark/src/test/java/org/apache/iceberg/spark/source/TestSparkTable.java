@@ -19,13 +19,16 @@
 package org.apache.iceberg.spark.source;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.iceberg.ParameterizedTestExtension;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.spark.CatalogTestBase;
 import org.apache.iceberg.spark.SparkSQLProperties;
@@ -36,6 +39,7 @@ import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.catalog.constraints.Constraint;
 import org.apache.spark.sql.connector.catalog.constraints.PrimaryKey;
 import org.apache.spark.sql.connector.expressions.NamedReference;
+import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.TestTemplate;
@@ -64,6 +68,77 @@ public class TestSparkTable extends CatalogTestBase {
     // different instances pointing to the same table must be equivalent
     assertThat(table1).as("References must be different").isNotSameAs(table2);
     assertThat(table1).as("Tables must be equivalent").isEqualTo(table2);
+  }
+
+  @TestTemplate
+  public void testRecoveryAnchorPinsSnapshotAndSchemaAcrossConcurrentCommits() {
+    sql("INSERT INTO %s VALUES (1, 'a', 'first')", tableName);
+    SparkTable original = loadSparkTable();
+    String anchor = original.currentRecoveryAnchor();
+
+    sql("ALTER TABLE %s ADD COLUMN added string", tableName);
+    sql("INSERT INTO %s VALUES (2, 'b', 'second', 'new')", tableName);
+    SparkTable current = loadSparkTable();
+    assertThat(current.currentRecoveryAnchor()).isNotEqualTo(anchor);
+
+    SparkTable recovered = (SparkTable) current.withRecoveryAnchor(anchor);
+    assertThat(recovered.currentRecoveryAnchor()).isEqualTo(anchor);
+    assertThat(recovered.snapshotId()).isEqualTo(original.snapshotId());
+    assertThat(recovered.schema()).isEqualTo(original.schema());
+    assertThat(recovered.recoverySourceId()).isEqualTo(original.recoverySourceId());
+  }
+
+  @TestTemplate
+  public void testRecoveryAnchorPinsSnapshotlessTableAndSchema() {
+    SparkTable original = loadSparkTable();
+    String anchor = original.currentRecoveryAnchor();
+    assertThat(original.snapshotId()).isNull();
+
+    sql("ALTER TABLE %s ADD COLUMN added string", tableName);
+    sql("INSERT INTO %s VALUES (1, 'a', 'first', 'new')", tableName);
+
+    SparkTable recovered = (SparkTable) loadSparkTable().withRecoveryAnchor(anchor);
+    assertThat(recovered.currentRecoveryAnchor()).isEqualTo(anchor);
+    assertThat(recovered.snapshotId()).isNull();
+    assertThat(recovered.schema()).isEqualTo(original.schema());
+    assertThat(
+            recovered
+                .newScanBuilder(CaseInsensitiveStringMap.empty())
+                .build()
+                .toBatch()
+                .planInputPartitions())
+        .isEmpty();
+  }
+
+  @TestTemplate
+  public void testRecoveryAnchorFailsClosedWhenSnapshotExpired() {
+    sql("INSERT INTO %s VALUES (1, 'a', 'first')", tableName);
+    SparkTable original = loadSparkTable();
+    String anchor = original.currentRecoveryAnchor();
+    long originalSnapshotId = original.snapshotId();
+
+    sql("INSERT INTO %s VALUES (2, 'b', 'second')", tableName);
+    SparkTable current = loadSparkTable();
+    Snapshot currentSnapshot = current.table().currentSnapshot();
+    current.table().expireSnapshots().expireSnapshotId(originalSnapshotId).commit();
+    assertThat(current.table().snapshot(currentSnapshot.snapshotId())).isNotNull();
+
+    assertThatThrownBy(() -> loadSparkTable().withRecoveryAnchor(anchor))
+        .isInstanceOf(ValidationException.class)
+        .hasMessageContaining("Cannot recover expired Iceberg snapshot ID");
+  }
+
+  @TestTemplate
+  public void testRecoverySourceAndSinkIdentitiesIncludeBranchSelector() {
+    sql("INSERT INTO %s VALUES (1, 'a', 'first')", tableName);
+    SparkTable main = loadSparkTable();
+    main.table().manageSnapshots().createBranch("audit").commit();
+
+    SparkTable audit = main.copyWithBranch("audit");
+    assertThat(audit.recoverySourceId()).isNotEqualTo(main.recoverySourceId());
+    assertThat(audit.recoverySourceId()).isEqualTo(main.copyWithBranch("audit").recoverySourceId());
+    assertThat(audit.recoverySinkId()).isNotEqualTo(main.recoverySinkId());
+    assertThat(audit.recoverySinkId()).isEqualTo(main.copyWithBranch("audit").recoverySinkId());
   }
 
   @TestTemplate

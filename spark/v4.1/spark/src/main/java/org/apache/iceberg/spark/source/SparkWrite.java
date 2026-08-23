@@ -23,6 +23,7 @@ import static org.apache.iceberg.IsolationLevel.SNAPSHOT;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
@@ -44,6 +45,7 @@ import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.exceptions.CleanableFailure;
 import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.ExpressionParser;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.ClusteredDataWriter;
 import org.apache.iceberg.io.DataWriteResult;
@@ -77,12 +79,16 @@ import org.apache.spark.sql.connector.expressions.SortOrder;
 import org.apache.spark.sql.connector.metric.CustomMetric;
 import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.write.BatchWrite;
+import org.apache.spark.sql.connector.write.BatchWriteRecoveryState;
 import org.apache.spark.sql.connector.write.DataWriter;
 import org.apache.spark.sql.connector.write.DataWriterFactory;
 import org.apache.spark.sql.connector.write.LogicalWriteInfo;
 import org.apache.spark.sql.connector.write.MergeSummary;
 import org.apache.spark.sql.connector.write.PhysicalWriteInfo;
+import org.apache.spark.sql.connector.write.RecoveryDataWriter;
+import org.apache.spark.sql.connector.write.RecoveryDataWriterFactory;
 import org.apache.spark.sql.connector.write.RequiresDistributionAndOrdering;
+import org.apache.spark.sql.connector.write.SupportsBatchWriteRecovery;
 import org.apache.spark.sql.connector.write.Write;
 import org.apache.spark.sql.connector.write.WriteSummary;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
@@ -99,6 +105,7 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
   private final SparkWriteConf writeConf;
   private final Table table;
   private final String queryId;
+  private final boolean recoveryEnabled;
   private final FileFormat format;
   private final String applicationId;
   private final boolean wapEnabled;
@@ -131,6 +138,7 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
     this.table = table;
     this.writeConf = writeConf;
     this.queryId = writeInfo.queryId();
+    this.recoveryEnabled = writeInfo.isRecoveryEnabled();
     this.format = writeConf.dataFileFormat();
     this.applicationId = applicationId;
     this.wapEnabled = writeConf.wapEnabled();
@@ -184,22 +192,24 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
   }
 
   BatchWrite asBatchAppend() {
-    return new BatchAppend();
+    return recoverable(new BatchAppend());
   }
 
   BatchWrite asDynamicOverwrite() {
-    return new DynamicOverwrite();
+    return recoverable(new DynamicOverwrite());
   }
 
   BatchWrite asOverwriteByFilter(Expression overwriteExpr) {
-    return new OverwriteByFilter(overwriteExpr);
+    return recoverable(new OverwriteByFilter(overwriteExpr));
   }
 
   BatchWrite asCopyOnWriteOperation(SparkCopyOnWriteScan scan, IsolationLevel isolationLevel) {
-    return new CopyOnWriteOperation(scan, isolationLevel);
+    return recoverable(new CopyOnWriteOperation(scan, isolationLevel));
   }
 
   BatchWrite asRewrite(String fileSetID) {
+    Preconditions.checkState(
+        !recoveryEnabled, "Spark file rewrite recovery requires a durable rewrite coordinator");
     return new RewriteFiles(fileSetID);
   }
 
@@ -239,6 +249,10 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
     LOG.info("Committing {} to table {}", description, table);
     if (applicationId != null) {
       operation.set("spark.app.id", applicationId);
+    }
+
+    if (recoveryEnabled) {
+      SparkWriteRecovery.markCommit(operation, queryId);
     }
 
     if (!extraSnapshotMetadata.isEmpty()) {
@@ -309,7 +323,7 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
   private abstract class BaseBatchWrite implements BatchWrite {
     @Override
     public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo info) {
-      return createWriterFactory();
+      return new RecoverableWriterFactory(createWriterFactory(), table);
     }
 
     @Override
@@ -325,6 +339,116 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
     @Override
     public String toString() {
       return String.format("IcebergBatchWrite(table=%s, format=%s)", table, format);
+    }
+  }
+
+  private BatchWrite recoverable(BaseBatchWrite delegate) {
+    return recoveryEnabled ? new RecoverableBatchWrite(delegate) : delegate;
+  }
+
+  private class RecoverableBatchWrite implements SupportsBatchWriteRecovery {
+    private final BaseBatchWrite delegate;
+
+    private RecoverableBatchWrite(BaseBatchWrite delegate) {
+      this.delegate = delegate;
+    }
+
+    public String recoveryId() {
+      return queryId;
+    }
+
+    public SparkWriteRecoveryTaskCodec commitMessageCodec() {
+      return new SparkWriteRecoveryTaskCodec(table);
+    }
+
+    public byte[] recoveryCompatibilityMetadata(PhysicalWriteInfo info) {
+      Map<String, String> snapshotProperties = new HashMap<>(extraSnapshotMetadata);
+      snapshotProperties.putAll(CommitMetadata.commitProperties());
+      final String operation;
+      final boolean allowConcurrentSnapshots;
+      final byte[] operationMetadata;
+      if (delegate instanceof BatchAppend) {
+        operation = "append";
+        allowConcurrentSnapshots = true;
+        operationMetadata = new byte[0];
+      } else if (delegate instanceof DynamicOverwrite) {
+        operation = "dynamic-overwrite";
+        allowConcurrentSnapshots = false;
+        operationMetadata = new byte[0];
+      } else if (delegate instanceof OverwriteByFilter overwrite) {
+        operation = "overwrite-by-filter";
+        allowConcurrentSnapshots = false;
+        IsolationLevel isolationLevel = writeConf.isolationLevel();
+        operationMetadata =
+            SparkWriteRecoveryCompatibility.encodeOverwriteFilter(
+                ExpressionParser.toJson(overwrite.overwriteExpr),
+                isolationLevel != null ? isolationLevel.name() : null,
+                writeConf.validateFromSnapshotId());
+      } else {
+        throw new UnsupportedOperationException(
+            "Recoverable Iceberg copy-on-write and row-level operations are not yet supported");
+      }
+
+      return SparkWriteRecoveryCompatibility.encode(
+          table,
+          writeSchema,
+          table.specs().get(outputSpecId),
+          table.sortOrders().get(writeConf.outputSortOrderId(writeRequirements)),
+          format.name(),
+          targetFileSize,
+          useFanoutWriter,
+          writeProperties,
+          snapshotProperties,
+          branch,
+          wapEnabled,
+          wapId,
+          operation,
+          allowConcurrentSnapshots,
+          operationMetadata);
+    }
+
+    @Override
+    public BatchWriteRecoveryState recover(PhysicalWriteInfo info) {
+      return SparkWriteRecovery.recover(table, queryId, info.numPartitions());
+    }
+
+    @Override
+    public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo info) {
+      return createWriterFactory();
+    }
+
+    @Override
+    public boolean useCommitCoordinator() {
+      return delegate.useCommitCoordinator();
+    }
+
+    @Override
+    public void commit(WriterCommitMessage[] messages) {
+      if (!SparkWriteRecovery.isCommitted(table, queryId)) {
+        delegate.commit(messages);
+      }
+    }
+
+    @Override
+    public void commit(WriterCommitMessage[] messages, WriteSummary summary) {
+      if (!SparkWriteRecovery.isCommitted(table, queryId)) {
+        delegate.commit(messages, summary);
+      }
+    }
+
+    @Override
+    public void abort(WriterCommitMessage[] messages) {
+      delegate.abort(messages);
+    }
+
+    @Override
+    public void abortAfterRecovery(WriterCommitMessage[] messages) {
+      LOG.warn("Preserving durable task files for resumable Spark write {}", queryId);
+    }
+
+    @Override
+    public String toString() {
+      return delegate.toString();
     }
   }
 
@@ -764,12 +888,12 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
 
       Function<InternalRow, InternalRow> rowLineageExtractor = new ExtractRowLineage(writeSchema);
 
+      DataWriter<InternalRow> writer;
       if (spec.isUnpartitioned()) {
-        return new UnpartitionedDataWriter(
+        writer = new UnpartitionedDataWriter(
             writerFactory, fileFactory, io, spec, targetFileSize, rowLineageExtractor);
-
       } else {
-        return new PartitionedDataWriter(
+        writer = new PartitionedDataWriter(
             writerFactory,
             fileFactory,
             io,
@@ -780,6 +904,74 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
             useFanoutWriter,
             rowLineageExtractor);
       }
+      return writer;
+    }
+  }
+
+  /** Adds the post-commit cleanup contract only to recovery-enabled batch writers. */
+  private static class RecoverableWriterFactory implements RecoveryDataWriterFactory {
+    private final DataWriterFactory delegate;
+    private final Table table;
+
+    private RecoverableWriterFactory(DataWriterFactory delegate, Table table) {
+      this.delegate = delegate;
+      this.table = SerializableTableWithSize.copyOf(table);
+    }
+
+    @Override
+    public RecoveryDataWriter createWriter(int partitionId, long taskId) {
+      return new RecoverableDataWriter(delegate.createWriter(partitionId, taskId), table.io());
+    }
+  }
+
+  /** Deletes files produced by a speculative/retried attempt that loses durable arbitration. */
+  private static class RecoverableDataWriter implements RecoveryDataWriter {
+    private final DataWriter<InternalRow> delegate;
+    private final FileIO io;
+
+    private RecoverableDataWriter(DataWriter<InternalRow> delegate, FileIO io) {
+      this.delegate = delegate;
+      this.io = io;
+    }
+
+    @Override
+    public void write(InternalRow record) throws IOException {
+      delegate.write(record);
+    }
+
+    @Override
+    public void write(InternalRow metadata, InternalRow record) throws IOException {
+      delegate.write(metadata, record);
+    }
+
+    @Override
+    public WriterCommitMessage commit() throws IOException {
+      return delegate.commit();
+    }
+
+    @Override
+    public void abort() throws IOException {
+      delegate.abort();
+    }
+
+    @Override
+    public void close() throws IOException {
+      delegate.close();
+    }
+
+    @Override
+    public CustomTaskMetric[] currentMetricsValues() {
+      return delegate.currentMetricsValues();
+    }
+
+    @Override
+    public void discardCommittedOutput(WriterCommitMessage committedMessage) {
+      Preconditions.checkState(
+          committedMessage instanceof TaskCommit,
+          "Invalid Iceberg recovery commit message: %s",
+          committedMessage != null ? committedMessage.getClass().getName() : "null");
+      SparkCleanupUtil.deleteTaskFiles(
+          io, Arrays.asList(((TaskCommit) committedMessage).files()));
     }
   }
 

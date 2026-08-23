@@ -20,6 +20,11 @@ package org.apache.iceberg;
 
 import static org.apache.iceberg.TableProperties.COMMIT_MAX_RETRY_WAIT_MS;
 import static org.apache.iceberg.TableProperties.COMMIT_MAX_RETRY_WAIT_MS_DEFAULT;
+import static org.apache.iceberg.TableProperties.COMMIT_IDEMPOTENCY_ENTRY_PREFIX;
+import static org.apache.iceberg.TableProperties.COMMIT_IDEMPOTENCY_MAX_ENTRIES;
+import static org.apache.iceberg.TableProperties.COMMIT_IDEMPOTENCY_MAX_ENTRIES_DEFAULT;
+import static org.apache.iceberg.TableProperties.COMMIT_IDEMPOTENCY_RETENTION_MS;
+import static org.apache.iceberg.TableProperties.COMMIT_IDEMPOTENCY_RETENTION_MS_DEFAULT;
 import static org.apache.iceberg.TableProperties.COMMIT_MIN_RETRY_WAIT_MS;
 import static org.apache.iceberg.TableProperties.COMMIT_MIN_RETRY_WAIT_MS_DEFAULT;
 import static org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES;
@@ -33,9 +38,21 @@ import static org.apache.iceberg.TableProperties.SNAPSHOT_ID_INHERITANCE_ENABLED
 
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.math.RoundingMode;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
@@ -43,6 +60,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -88,6 +106,9 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   private static final Logger LOG = LoggerFactory.getLogger(SnapshotProducer.class);
   static final int MIN_FILE_GROUP_SIZE = 10_000;
   static final Set<ManifestFile> EMPTY_SET = Sets.newHashSet();
+  private static final int IDEMPOTENCY_LEDGER_VERSION = 1;
+  private static final int MAX_IDEMPOTENCY_FIELD_BYTES = 4096;
+  private static final int MAX_IDEMPOTENCY_LEDGER_ENCODED_CHARS = 16 * 1024;
 
   /** Default callback used to delete files. */
   private final Consumer<String> defaultDelete =
@@ -118,6 +139,8 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   private Consumer<String> deleteFunc = defaultDelete;
   private SnapshotAncestryValidator snapshotAncestryValidator =
       SnapshotAncestryValidator.NON_VALIDATING;
+  private String idempotencyProperty = null;
+  private String idempotencyValue = null;
 
   private ExecutorService workerPool;
   private ExecutorService writePool;
@@ -154,6 +177,28 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   }
 
   protected abstract ThisT self();
+
+  @Override
+  public ThisT idempotencyKey(String property, String value) {
+    Preconditions.checkArgument(
+        property != null && !property.isEmpty(), "Invalid idempotency property: %s", property);
+    Preconditions.checkArgument(
+        value != null && !value.isEmpty(), "Invalid idempotency value: %s", value);
+    Preconditions.checkArgument(
+        property.getBytes(StandardCharsets.UTF_8).length <= MAX_IDEMPOTENCY_FIELD_BYTES,
+        "Idempotency property is too large");
+    Preconditions.checkArgument(
+        value.getBytes(StandardCharsets.UTF_8).length <= MAX_IDEMPOTENCY_FIELD_BYTES,
+        "Idempotency value is too large");
+    Preconditions.checkState(
+        idempotencyProperty == null
+            || (idempotencyProperty.equals(property) && idempotencyValue.equals(value)),
+        "Cannot change snapshot idempotency key once set");
+    this.idempotencyProperty = property;
+    this.idempotencyValue = value;
+    set(property, value);
+    return self();
+  }
 
   @Override
   public ThisT stageOnly() {
@@ -480,6 +525,7 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   public void commit() {
     // this is always set to the latest commit attempt's snapshot id.
     AtomicLong newSnapshotId = new AtomicLong(-1L);
+    AtomicBoolean duplicateCommit = new AtomicBoolean(false);
     try (Timed ignore = commitMetrics().totalDuration().start()) {
       try {
         Tasks.foreach(ops)
@@ -493,6 +539,12 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
             .countAttempts(commitMetrics().attempts())
             .run(
                 taskOps -> {
+                  Long existingSnapshotID = findIdempotentSnapshotID(refresh());
+                  if (existingSnapshotID != null) {
+                    newSnapshotId.set(existingSnapshotID);
+                    duplicateCommit.set(true);
+                    return;
+                  }
                   Snapshot newSnapshot = apply();
                   newSnapshotId.set(newSnapshot.snapshotId());
                   TableMetadata.Builder update = TableMetadata.buildFrom(base);
@@ -504,6 +556,7 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
                   } else {
                     update.setBranchSnapshot(newSnapshot, targetBranch);
                   }
+                  updateIdempotencyLedger(update, base, newSnapshot);
 
                   TableMetadata updated = update.build();
                   if (updated.changes().isEmpty()) {
@@ -563,10 +616,235 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
       }
     }
 
+    if (!duplicateCommit.get()) {
+      try {
+        notifyListeners();
+      } catch (Throwable e) {
+        LOG.warn("Failed to notify event listeners", e);
+      }
+    }
+  }
+
+  private Long findIdempotentSnapshotID(TableMetadata metadata) {
+    if (idempotencyProperty == null) {
+      return null;
+    }
+
+    String ledgerValue = metadata.properties().get(idempotencyLedgerKey());
+    if (ledgerValue != null) {
+      IdempotencyLedgerEntry entry = decodeIdempotencyLedgerEntry(ledgerValue);
+      Preconditions.checkState(
+          idempotencyProperty.equals(entry.property) && idempotencyValue.equals(entry.value),
+          "Idempotency ledger hash collision for property %s",
+          idempotencyProperty);
+      return entry.snapshotID;
+    }
+
+    for (Snapshot snapshot : metadata.snapshots()) {
+      if (idempotencyValue.equals(snapshot.summary().get(idempotencyProperty))) {
+        return snapshot.snapshotId();
+      }
+    }
+
+    return null;
+  }
+
+  private void updateIdempotencyLedger(
+      TableMetadata.Builder update, TableMetadata metadata, Snapshot snapshot) {
+    if (idempotencyProperty == null) {
+      return;
+    }
+
+    long retentionMillis =
+        metadata.propertyAsLong(
+            COMMIT_IDEMPOTENCY_RETENTION_MS, COMMIT_IDEMPOTENCY_RETENTION_MS_DEFAULT);
+    int maxEntries =
+        metadata.propertyAsInt(
+            COMMIT_IDEMPOTENCY_MAX_ENTRIES, COMMIT_IDEMPOTENCY_MAX_ENTRIES_DEFAULT);
+    Preconditions.checkState(
+        retentionMillis > 0,
+        "Invalid idempotency ledger retention: %s ms",
+        retentionMillis);
+    Preconditions.checkState(
+        maxEntries > 0, "Invalid idempotency ledger maximum entries: %s", maxEntries);
+
+    long oldestRetainedTimestamp = System.currentTimeMillis() - retentionMillis;
+    Set<String> expired = Sets.newHashSet();
+    int liveEntries = 0;
+    for (Map.Entry<String, String> property : metadata.properties().entrySet()) {
+      if (property.getKey().startsWith(COMMIT_IDEMPOTENCY_ENTRY_PREFIX)) {
+        IdempotencyLedgerEntry entry = decodeIdempotencyLedgerEntry(property.getValue());
+        Preconditions.checkState(
+            property.getKey().equals(idempotencyLedgerKey(entry.property, entry.value)),
+            "Idempotency ledger hash collision or corrupt key");
+        if (entry.committedAtMillis < oldestRetainedTimestamp) {
+          expired.add(property.getKey());
+        } else {
+          liveEntries += 1;
+        }
+      }
+    }
+
+    Preconditions.checkState(
+        liveEntries < maxEntries,
+        "Idempotency ledger contains %s live entries; maximum is %s",
+        liveEntries,
+        maxEntries);
+    update.removeProperties(expired);
+    update.setProperties(
+        ImmutableMap.of(
+            idempotencyLedgerKey(),
+            encodeIdempotencyLedgerEntry(
+                new IdempotencyLedgerEntry(
+                    idempotencyProperty,
+                    idempotencyValue,
+                    snapshot.snapshotId(),
+                    snapshot.timestampMillis(),
+                    addedRows(snapshot)))));
+  }
+
+  private String idempotencyLedgerKey() {
+    return idempotencyLedgerKey(idempotencyProperty, idempotencyValue);
+  }
+
+  private static String idempotencyLedgerKey(String propertyString, String valueString) {
+    byte[] property = propertyString.getBytes(StandardCharsets.UTF_8);
+    byte[] value = valueString.getBytes(StandardCharsets.UTF_8);
+    try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        DataOutputStream data = new DataOutputStream(bytes)) {
+      writeBytes(data, property);
+      writeBytes(data, value);
+      data.flush();
+      return COMMIT_IDEMPOTENCY_ENTRY_PREFIX + hex(sha256(bytes.toByteArray()));
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to build idempotency ledger key", e);
+    }
+  }
+
+  private static String encodeIdempotencyLedgerEntry(IdempotencyLedgerEntry entry) {
+    try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        DataOutputStream data = new DataOutputStream(bytes)) {
+      data.writeInt(IDEMPOTENCY_LEDGER_VERSION);
+      writeBytes(data, entry.property.getBytes(StandardCharsets.UTF_8));
+      writeBytes(data, entry.value.getBytes(StandardCharsets.UTF_8));
+      data.writeLong(entry.snapshotID);
+      data.writeLong(entry.committedAtMillis);
+      data.writeLong(entry.addedRows);
+      data.flush();
+      return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes.toByteArray());
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to encode idempotency ledger entry", e);
+    }
+  }
+
+  private static IdempotencyLedgerEntry decodeIdempotencyLedgerEntry(String encoded) {
+    Preconditions.checkState(
+        encoded != null && encoded.length() <= MAX_IDEMPOTENCY_LEDGER_ENCODED_CHARS,
+        "Invalid idempotency ledger encoded length");
+    final byte[] bytes;
     try {
-      notifyListeners();
-    } catch (Throwable e) {
-      LOG.warn("Failed to notify event listeners", e);
+      bytes = Base64.getUrlDecoder().decode(encoded);
+    } catch (IllegalArgumentException e) {
+      throw new IllegalStateException("Invalid idempotency ledger encoding", e);
+    }
+
+    try (DataInputStream data = new DataInputStream(new ByteArrayInputStream(bytes))) {
+      int version = data.readInt();
+      Preconditions.checkState(
+          version == IDEMPOTENCY_LEDGER_VERSION,
+          "Unsupported idempotency ledger version: %s",
+          version);
+      String property = decodeUtf8(readBytes(data, MAX_IDEMPOTENCY_FIELD_BYTES));
+      String value = decodeUtf8(readBytes(data, MAX_IDEMPOTENCY_FIELD_BYTES));
+      long snapshotID = data.readLong();
+      long committedAtMillis = data.readLong();
+      long addedRows = data.readLong();
+      Preconditions.checkState(snapshotID >= 0, "Invalid idempotency ledger snapshot ID");
+      Preconditions.checkState(committedAtMillis >= 0, "Invalid idempotency ledger timestamp");
+      Preconditions.checkState(data.read() == -1, "Trailing bytes in idempotency ledger entry");
+      return new IdempotencyLedgerEntry(
+          property, value, snapshotID, committedAtMillis, addedRows);
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to decode idempotency ledger entry", e);
+    }
+  }
+
+  private static long addedRows(Snapshot snapshot) {
+    String rows = snapshot.summary().get(SnapshotSummary.ADDED_RECORDS_PROP);
+    if (rows == null) {
+      return -1L;
+    }
+
+    try {
+      return Long.parseLong(rows);
+    } catch (NumberFormatException e) {
+      return -1L;
+    }
+  }
+
+  private static void writeBytes(DataOutputStream data, byte[] value) throws IOException {
+    data.writeInt(value.length);
+    data.write(value);
+  }
+
+  private static byte[] readBytes(DataInputStream data, int maximumLength) throws IOException {
+    int length = data.readInt();
+    Preconditions.checkState(
+        length >= 0 && length <= maximumLength && length <= data.available(),
+        "Invalid idempotency ledger field length: %s",
+        length);
+    byte[] value = new byte[length];
+    data.readFully(value);
+    return value;
+  }
+
+  private static String decodeUtf8(byte[] value) {
+    try {
+      return StandardCharsets.UTF_8
+          .newDecoder()
+          .onMalformedInput(CodingErrorAction.REPORT)
+          .onUnmappableCharacter(CodingErrorAction.REPORT)
+          .decode(ByteBuffer.wrap(value))
+          .toString();
+    } catch (CharacterCodingException e) {
+      throw new IllegalStateException("Invalid UTF-8 in idempotency ledger entry", e);
+    }
+  }
+
+  private static byte[] sha256(byte[] value) {
+    try {
+      return MessageDigest.getInstance("SHA-256").digest(value);
+    } catch (NoSuchAlgorithmException e) {
+      throw new IllegalStateException("SHA-256 is unavailable", e);
+    }
+  }
+
+  private static String hex(byte[] value) {
+    StringBuilder builder = new StringBuilder(value.length * 2);
+    for (byte next : value) {
+      builder.append(String.format(Locale.ROOT, "%02x", next & 0xff));
+    }
+    return builder.toString();
+  }
+
+  private static class IdempotencyLedgerEntry {
+    private final String property;
+    private final String value;
+    private final long snapshotID;
+    private final long committedAtMillis;
+    private final long addedRows;
+
+    private IdempotencyLedgerEntry(
+        String property,
+        String value,
+        long snapshotID,
+        long committedAtMillis,
+        long addedRows) {
+      this.property = property;
+      this.value = value;
+      this.snapshotID = snapshotID;
+      this.committedAtMillis = committedAtMillis;
+      this.addedRows = addedRows;
     }
   }
 

@@ -38,6 +38,23 @@ public interface SnapshotUpdate<ThisT> extends PendingUpdate<Snapshot> {
   ThisT set(String property, String value);
 
   /**
+   * Make this snapshot update idempotent using a summary property and value.
+   *
+   * <p>Before every metadata commit attempt, implementations must check all retained snapshots. If
+   * a snapshot already contains the same property and value, the update succeeds without creating
+   * another snapshot. Callers must use a value that uniquely identifies the same logical update;
+   * reusing it for different updates has undefined results.
+   *
+   * @param property a snapshot summary property used as the idempotency namespace
+   * @param value the immutable logical update identifier
+   * @return this for method chaining
+   */
+  default ThisT idempotencyKey(String property, String value) {
+    throw new UnsupportedOperationException(
+        this.getClass().getName() + " does not support idempotent snapshot updates");
+  }
+
+  /**
    * Set a callback to delete files instead of the table's default.
    *
    * @param deleteFunc a String consumer used to delete locations.
