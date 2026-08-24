@@ -1,0 +1,24 @@
+
+// B6 bridge: the recovery suite targets the 5.0.0-SNAPSHOT fork, whose divergences (views,
+// jetty ee10, spatial types) block this module's regular test sourceset from compiling against
+// it. The recovery tests are self-contained - no SparkSession, no data helpers - so they get
+// their own sourceset and can run against the fork while the 4.1 suite stays on stock Spark.
+sourceSets {
+  recoveryTest {
+    java.srcDirs = ['src/recovery/java']
+    compileClasspath += sourceSets.main.output
+    runtimeClasspath += sourceSets.main.output
+  }
+}
+
+configurations {
+  recoveryTestImplementation.extendsFrom testImplementation
+  recoveryTestRuntimeOnly.extendsFrom testRuntimeOnly
+}
+
+tasks.register('recoveryTest', Test) {
+  description = 'Runs the resumable-write recovery tests against the forked Spark build.'
+  testClassesDirs = sourceSets.recoveryTest.output.classesDirs
+  classpath = sourceSets.recoveryTest.runtimeClasspath
+  useJUnitPlatform()
+}

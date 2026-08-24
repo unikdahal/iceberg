@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.source;
 
 import static org.apache.iceberg.TableProperties.FORMAT_VERSION;
 
+import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -33,7 +34,14 @@ import org.apache.iceberg.view.View;
 import org.apache.iceberg.view.ViewOperations;
 import org.apache.spark.sql.types.StructType;
 
-public class SparkView implements org.apache.spark.sql.connector.catalog.View {
+/**
+ * Exposes an Iceberg view as Spark's connector {@link org.apache.spark.sql.connector.catalog.View}.
+ *
+ * <p>Spark 5 turned that interface into a builder-built class, so this wrapper both extends it -
+ * supplying the builder with everything Iceberg can answer - and overrides every accessor with
+ * values read straight from the Iceberg view, so behaviour never depends on what the builder kept.
+ */
+public class SparkView extends org.apache.spark.sql.connector.catalog.View {
 
   public static final String QUERY_COLUMN_NAMES = "spark.query-column-names";
   public static final Set<String> RESERVED_PROPERTIES =
@@ -44,21 +52,44 @@ public class SparkView implements org.apache.spark.sql.connector.catalog.View {
   private StructType lazySchema = null;
 
   public SparkView(String catalogName, View icebergView) {
+    super(builder(catalogName, icebergView));
     this.catalogName = catalogName;
     this.icebergView = icebergView;
+  }
+
+  private static org.apache.spark.sql.connector.catalog.View.Builder builder(
+      String catalogName, View icebergView) {
+    org.apache.spark.sql.connector.catalog.View.Builder builder =
+        new org.apache.spark.sql.connector.catalog.View.Builder()
+            .withCurrentCatalog(
+                icebergView.currentVersion().defaultCatalog() != null
+                    ? icebergView.currentVersion().defaultCatalog()
+                    : catalogName)
+            .withCurrentNamespace(icebergView.currentVersion().defaultNamespace().levels())
+            .withProperties(icebergView.properties())
+            .withSchema(SparkSchemaUtil.convert(icebergView.schema()))
+            .withSqlConfigs(Collections.emptyMap());
+    if (icebergView.properties().containsKey(QUERY_COLUMN_NAMES)) {
+      builder.withQueryColumnNames(
+          icebergView.properties().get(QUERY_COLUMN_NAMES).split(","));
+    }
+    SQLViewRepresentation sqlRepr = icebergView.sqlFor("spark");
+    if (sqlRepr != null) {
+      builder.withQueryText(sqlRepr.sql());
+    }
+    return builder;
   }
 
   public View view() {
     return icebergView;
   }
 
-  @Override
   public String name() {
     return icebergView.name();
   }
 
   @Override
-  public String query() {
+  public String queryText() {
     SQLViewRepresentation sqlRepr = icebergView.sqlFor("spark");
     Preconditions.checkState(sqlRepr != null, "Cannot load SQL for view %s", name());
     return sqlRepr.sql();
@@ -92,14 +123,12 @@ public class SparkView implements org.apache.spark.sql.connector.catalog.View {
         : new String[0];
   }
 
-  @Override
   public String[] columnAliases() {
     return icebergView.schema().columns().stream()
         .map(Types.NestedField::name)
         .toArray(String[]::new);
   }
 
-  @Override
   public String[] columnComments() {
     return icebergView.schema().columns().stream()
         .map(Types.NestedField::doc)

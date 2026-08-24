@@ -48,8 +48,6 @@ import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.catalog.TableChange;
 import org.apache.spark.sql.connector.catalog.View;
 import org.apache.spark.sql.connector.catalog.ViewCatalog;
-import org.apache.spark.sql.connector.catalog.ViewChange;
-import org.apache.spark.sql.connector.catalog.ViewInfo;
 import org.apache.spark.sql.connector.catalog.functions.UnboundFunction;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.types.StructType;
@@ -457,16 +455,16 @@ public class SparkSessionCatalog<
   }
 
   @Override
-  public View createView(ViewInfo viewInfo)
+  public View createView(Identifier ident, View view)
       throws ViewAlreadyExistsException, NoSuchNamespaceException {
-    if (viewInfo == null) {
+    if (view == null) {
       return null;
     }
 
     if (null != asViewCatalog) {
-      return asViewCatalog.createView(viewInfo);
+      return asViewCatalog.createView(ident, view);
     } else if (isViewCatalog()) {
-      return getSessionCatalog().createView(viewInfo);
+      return getSessionCatalog().createView(ident, view);
     }
 
     throw new UnsupportedOperationException(
@@ -474,47 +472,15 @@ public class SparkSessionCatalog<
   }
 
   @Override
-  public View replaceView(
-      Identifier ident,
-      String sql,
-      String currentCatalog,
-      String[] currentNamespace,
-      StructType schema,
-      String[] queryColumnNames,
-      String[] columnAliases,
-      String[] columnComments,
-      Map<String, String> properties)
-      throws NoSuchNamespaceException, NoSuchViewException {
-    if (asViewCatalog instanceof SupportsReplaceView) {
-      return ((SupportsReplaceView) asViewCatalog)
-          .replaceView(
-              ident,
-              sql,
-              currentCatalog,
-              currentNamespace,
-              schema,
-              queryColumnNames,
-              columnAliases,
-              columnComments,
-              properties);
+  public View replaceView(Identifier ident, View view) throws NoSuchViewException {
+    if (asViewCatalog != null && view != null) {
+      return asViewCatalog.replaceView(ident, view);
     }
 
     throw new UnsupportedOperationException(
         "Replacing a view is not supported by catalog: " + catalogName);
   }
 
-  @Override
-  public View alterView(Identifier ident, ViewChange... changes)
-      throws NoSuchViewException, IllegalArgumentException {
-    if (null != asViewCatalog && asViewCatalog.viewExists(ident)) {
-      return asViewCatalog.alterView(ident, changes);
-    } else if (isViewCatalog()) {
-      return getSessionCatalog().alterView(ident, changes);
-    }
-
-    throw new UnsupportedOperationException(
-        "Altering a view is not supported by catalog: " + catalogName);
-  }
 
   @Override
   public boolean dropView(Identifier ident) {

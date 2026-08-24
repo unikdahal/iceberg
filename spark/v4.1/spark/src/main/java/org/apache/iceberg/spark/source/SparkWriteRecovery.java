@@ -1,18 +1,20 @@
 /*
  * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to you under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *   http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
 package org.apache.iceberg.spark.source;
 
@@ -28,7 +30,6 @@ import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.Arrays;
 import java.util.Base64;
 import java.util.Locale;
 import java.util.Map;
@@ -38,7 +39,6 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.spark.sql.connector.write.BatchWriteRecoveryState;
-import org.apache.spark.sql.connector.write.WriterCommitMessage;
 
 /** Catalog-atomic global commit state for a resumable Spark batch write. */
 final class SparkWriteRecovery {
@@ -54,23 +54,12 @@ final class SparkWriteRecovery {
     Preconditions.checkArgument(numPartitions >= 0, "Invalid partition count: %s", numPartitions);
     table.refresh();
     CommitState committed = committedState(table, writeID);
-    WriterCommitMessage[] messages = new WriterCommitMessage[numPartitions];
-    long[] numRows = new long[numPartitions];
-    Arrays.fill(numRows, -1L);
+    // The durable task store owns per-partition messages and row counts; this state only answers
+    // whether the global commit already happened, which is what the catalog can arbitrate.
     return new BatchWriteRecoveryState() {
       @Override
       public boolean isCommitted() {
         return committed != null;
-      }
-
-      @Override
-      public WriterCommitMessage[] commitMessages() {
-        return messages;
-      }
-
-      @Override
-      public long[] numRows() {
-        return numRows;
       }
 
       @Override

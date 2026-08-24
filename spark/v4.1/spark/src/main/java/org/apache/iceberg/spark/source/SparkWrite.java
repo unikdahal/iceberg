@@ -890,19 +890,21 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
 
       DataWriter<InternalRow> writer;
       if (spec.isUnpartitioned()) {
-        writer = new UnpartitionedDataWriter(
-            writerFactory, fileFactory, io, spec, targetFileSize, rowLineageExtractor);
+        writer =
+            new UnpartitionedDataWriter(
+                writerFactory, fileFactory, io, spec, targetFileSize, rowLineageExtractor);
       } else {
-        writer = new PartitionedDataWriter(
-            writerFactory,
-            fileFactory,
-            io,
-            spec,
-            writeSchema,
-            dsSchema,
-            targetFileSize,
-            useFanoutWriter,
-            rowLineageExtractor);
+        writer =
+            new PartitionedDataWriter(
+                writerFactory,
+                fileFactory,
+                io,
+                spec,
+                writeSchema,
+                dsSchema,
+                targetFileSize,
+                useFanoutWriter,
+                rowLineageExtractor);
       }
       return writer;
     }
@@ -970,8 +972,7 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
           committedMessage instanceof TaskCommit,
           "Invalid Iceberg recovery commit message: %s",
           committedMessage != null ? committedMessage.getClass().getName() : "null");
-      SparkCleanupUtil.deleteTaskFiles(
-          io, Arrays.asList(((TaskCommit) committedMessage).files()));
+      SparkCleanupUtil.deleteTaskFiles(io, Arrays.asList(((TaskCommit) committedMessage).files()));
     }
   }
 

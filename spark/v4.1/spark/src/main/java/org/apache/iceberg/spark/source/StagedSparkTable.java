@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.source;
 
 import org.apache.iceberg.Transaction;
 import org.apache.spark.sql.connector.catalog.StagedTable;
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 
 public class StagedSparkTable extends SparkTable implements StagedTable {
   private final Transaction transaction;
@@ -37,5 +38,12 @@ public class StagedSparkTable extends SparkTable implements StagedTable {
   @Override
   public void abortStagedChanges() {
     // TODO: clean up
+  }
+
+  @Override
+  public CustomTaskMetric[] reportDriverMetrics() {
+    // Both parent paths supply this default and disagree only by inheritance, which Java forbids;
+    // the staged table itself contributes no driver metrics, so pick the StagedTable default.
+    return StagedTable.super.reportDriverMetrics();
   }
 }
