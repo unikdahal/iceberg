@@ -637,7 +637,7 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
           idempotencyProperty.equals(entry.property) && idempotencyValue.equals(entry.value),
           "Idempotency ledger hash collision for property %s",
           idempotencyProperty);
-      return entry.snapshotID;
+      return entry.snapshotId;
     }
 
     for (Snapshot snapshot : metadata.snapshots()) {
@@ -727,7 +727,7 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
       data.writeInt(IDEMPOTENCY_LEDGER_VERSION);
       writeBytes(data, entry.property.getBytes(StandardCharsets.UTF_8));
       writeBytes(data, entry.value.getBytes(StandardCharsets.UTF_8));
-      data.writeLong(entry.snapshotID);
+      data.writeLong(entry.snapshotId);
       data.writeLong(entry.committedAtMillis);
       data.writeLong(entry.addedRows);
       data.flush();
@@ -756,14 +756,14 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
           version);
       String property = decodeUtf8(readBytes(data, MAX_IDEMPOTENCY_FIELD_BYTES));
       String value = decodeUtf8(readBytes(data, MAX_IDEMPOTENCY_FIELD_BYTES));
-      long snapshotID = data.readLong();
+      long snapshotId = data.readLong();
       long committedAtMillis = data.readLong();
       long addedRows = data.readLong();
-      Preconditions.checkState(snapshotID >= 0, "Invalid idempotency ledger snapshot ID");
+      Preconditions.checkState(snapshotId >= 0, "Invalid idempotency ledger snapshot ID");
       Preconditions.checkState(committedAtMillis >= 0, "Invalid idempotency ledger timestamp");
       Preconditions.checkState(data.read() == -1, "Trailing bytes in idempotency ledger entry");
       return new IdempotencyLedgerEntry(
-          property, value, snapshotID, committedAtMillis, addedRows);
+          property, value, snapshotId, committedAtMillis, addedRows);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to decode idempotency ledger entry", e);
     }
@@ -830,19 +830,19 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   private static class IdempotencyLedgerEntry {
     private final String property;
     private final String value;
-    private final long snapshotID;
+    private final long snapshotId;
     private final long committedAtMillis;
     private final long addedRows;
 
     private IdempotencyLedgerEntry(
         String property,
         String value,
-        long snapshotID,
+        long snapshotId,
         long committedAtMillis,
         long addedRows) {
       this.property = property;
       this.value = value;
-      this.snapshotID = snapshotID;
+      this.snapshotId = snapshotId;
       this.committedAtMillis = committedAtMillis;
       this.addedRows = addedRows;
     }

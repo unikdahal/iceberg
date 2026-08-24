@@ -52,11 +52,11 @@ public class TestSnapshotIdempotency extends TestBase {
     AppendFiles first = table.newAppend().appendFile(FILE_A).idempotencyKey(KEY, value);
     AppendFiles racing = table.newAppend().appendFile(FILE_A).idempotencyKey(KEY, value);
     first.commit();
-    long snapshotID = table.currentSnapshot().snapshotId();
+    long snapshotId = table.currentSnapshot().snapshotId();
     racing.commit();
 
     assertThat(table.snapshots()).hasSize(1);
-    assertThat(table.currentSnapshot().snapshotId()).isEqualTo(snapshotID);
+    assertThat(table.currentSnapshot().snapshotId()).isEqualTo(snapshotId);
     assertThat(matchingEvents).hasValue(1);
   }
 
@@ -170,7 +170,7 @@ public class TestSnapshotIdempotency extends TestBase {
       int version,
       String property,
       String value,
-      long snapshotID,
+      long snapshotId,
       long timestamp,
       long addedRows,
       boolean trailing) {
@@ -180,7 +180,7 @@ public class TestSnapshotIdempotency extends TestBase {
       data.writeInt(version);
       writeString(data, property);
       writeString(data, value);
-      data.writeLong(snapshotID);
+      data.writeLong(snapshotId);
       data.writeLong(timestamp);
       data.writeLong(addedRows);
       if (trailing) {
