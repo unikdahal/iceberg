@@ -18,13 +18,14 @@
  */
 package org.apache.iceberg;
 
-import static org.apache.iceberg.TableProperties.COMMIT_MAX_RETRY_WAIT_MS;
-import static org.apache.iceberg.TableProperties.COMMIT_MAX_RETRY_WAIT_MS_DEFAULT;
 import static org.apache.iceberg.TableProperties.COMMIT_IDEMPOTENCY_ENTRY_PREFIX;
 import static org.apache.iceberg.TableProperties.COMMIT_IDEMPOTENCY_MAX_ENTRIES;
 import static org.apache.iceberg.TableProperties.COMMIT_IDEMPOTENCY_MAX_ENTRIES_DEFAULT;
+import static org.apache.iceberg.TableProperties.COMMIT_IDEMPOTENCY_RECOVERY_WINDOW_MS;
 import static org.apache.iceberg.TableProperties.COMMIT_IDEMPOTENCY_RETENTION_MS;
 import static org.apache.iceberg.TableProperties.COMMIT_IDEMPOTENCY_RETENTION_MS_DEFAULT;
+import static org.apache.iceberg.TableProperties.COMMIT_MAX_RETRY_WAIT_MS;
+import static org.apache.iceberg.TableProperties.COMMIT_MAX_RETRY_WAIT_MS_DEFAULT;
 import static org.apache.iceberg.TableProperties.COMMIT_MIN_RETRY_WAIT_MS;
 import static org.apache.iceberg.TableProperties.COMMIT_MIN_RETRY_WAIT_MS_DEFAULT;
 import static org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES;
@@ -649,6 +650,25 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
     return null;
   }
 
+  /**
+   * The ledger must outlive every recovery that depends on it: if the horizon closes first, a
+   * replacement pass finds committed task state but no proof of the commit and fails closed. A
+   * declared recovery window longer than the retention is therefore warned about rather than
+   * silently accepted.
+   */
+  static String ledgerHorizonWarning(long retentionMillis, long recoveryWindowMillis) {
+    if (recoveryWindowMillis <= 0 || recoveryWindowMillis <= retentionMillis) {
+      return null;
+    }
+
+    return String.format(
+        Locale.ROOT,
+        "Idempotency ledger retention (%d ms) is shorter than the declared recovery window"
+            + " (%d ms): commit proof can expire while recovery state is still live",
+        retentionMillis,
+        recoveryWindowMillis);
+  }
+
   private void updateIdempotencyLedger(
       TableMetadata.Builder update, TableMetadata metadata, Snapshot snapshot) {
     if (idempotencyProperty == null) {
@@ -662,11 +682,18 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
         metadata.propertyAsInt(
             COMMIT_IDEMPOTENCY_MAX_ENTRIES, COMMIT_IDEMPOTENCY_MAX_ENTRIES_DEFAULT);
     Preconditions.checkState(
-        retentionMillis > 0,
-        "Invalid idempotency ledger retention: %s ms",
-        retentionMillis);
+        retentionMillis > 0, "Invalid idempotency ledger retention: %s ms", retentionMillis);
     Preconditions.checkState(
         maxEntries > 0, "Invalid idempotency ledger maximum entries: %s", maxEntries);
+    long recoveryWindowMillis = metadata.propertyAsLong(COMMIT_IDEMPOTENCY_RECOVERY_WINDOW_MS, 0L);
+    Preconditions.checkState(
+        recoveryWindowMillis >= 0,
+        "Invalid idempotency recovery window: %s ms",
+        recoveryWindowMillis);
+    String horizonWarning = ledgerHorizonWarning(retentionMillis, recoveryWindowMillis);
+    if (horizonWarning != null) {
+      LOG.warn("{}", horizonWarning);
+    }
 
     long oldestRetainedTimestamp = System.currentTimeMillis() - retentionMillis;
     Set<String> expired = Sets.newHashSet();
@@ -762,8 +789,7 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
       Preconditions.checkState(snapshotId >= 0, "Invalid idempotency ledger snapshot ID");
       Preconditions.checkState(committedAtMillis >= 0, "Invalid idempotency ledger timestamp");
       Preconditions.checkState(data.read() == -1, "Trailing bytes in idempotency ledger entry");
-      return new IdempotencyLedgerEntry(
-          property, value, snapshotId, committedAtMillis, addedRows);
+      return new IdempotencyLedgerEntry(property, value, snapshotId, committedAtMillis, addedRows);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to decode idempotency ledger entry", e);
     }
@@ -835,11 +861,7 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
     private final long addedRows;
 
     private IdempotencyLedgerEntry(
-        String property,
-        String value,
-        long snapshotId,
-        long committedAtMillis,
-        long addedRows) {
+        String property, String value, long snapshotId, long committedAtMillis, long addedRows) {
       this.property = property;
       this.value = value;
       this.snapshotId = snapshotId;

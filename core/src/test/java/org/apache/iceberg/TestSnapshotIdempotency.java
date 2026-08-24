@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
@@ -133,10 +133,49 @@ public class TestSnapshotIdempotency extends TestBase {
   @TestTemplate
   public void rejectsUnboundedIdempotencyFields() {
     String oversized = "x".repeat(4097);
-    assertThatThrownBy(
-            () -> table.newAppend().appendFile(FILE_A).idempotencyKey(KEY, oversized))
+    assertThatThrownBy(() -> table.newAppend().appendFile(FILE_A).idempotencyKey(KEY, oversized))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("too large");
+  }
+
+  @TestTemplate
+  public void ledgerHorizonMustOutliveDeclaredRecoveryWindow() {
+    assertThat(SnapshotProducer.ledgerHorizonWarning(1000L, 999L)).isNull();
+    // The boundary is inclusive: a horizon exactly as long as the window protects it.
+    assertThat(SnapshotProducer.ledgerHorizonWarning(1000L, 1000L)).isNull();
+
+    String warning = SnapshotProducer.ledgerHorizonWarning(1000L, 1001L);
+    assertThat(warning).isNotNull();
+    assertThat(warning).contains("1000 ms").contains("1001 ms").contains("commit proof can expire");
+
+    assertThat(SnapshotProducer.ledgerHorizonWarning(1000L, 0L))
+        .as("an undeclared window disables the check")
+        .isNull();
+  }
+
+  @TestTemplate
+  public void commitWarnsButSucceedsWhenLedgerExpiresInsideRecoveryWindow() {
+    table
+        .updateProperties()
+        .set(TableProperties.COMMIT_IDEMPOTENCY_RETENTION_MS, "1000")
+        .set(TableProperties.COMMIT_IDEMPOTENCY_RECOVERY_WINDOW_MS, "2000")
+        .commit();
+    table.newAppend().appendFile(FILE_A).idempotencyKey(KEY, "short-horizon").commit();
+
+    assertThat(table.currentSnapshot().summary()).containsEntry(KEY, "short-horizon");
+    assertThat(table.properties()).containsKey(ledgerKey(KEY, "short-horizon"));
+  }
+
+  @TestTemplate
+  public void negativeRecoveryWindowIsRejectedAtCommitTime() {
+    table
+        .updateProperties()
+        .set(TableProperties.COMMIT_IDEMPOTENCY_RECOVERY_WINDOW_MS, "-1")
+        .commit();
+    assertThatThrownBy(
+            () -> table.newAppend().appendFile(FILE_A).idempotencyKey(KEY, "negative").commit())
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("Invalid idempotency recovery window");
   }
 
   private void assertCorruptLedgerRejected(String value) {

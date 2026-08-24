@@ -101,13 +101,19 @@ public class TableProperties {
   /** Prefix reserved for catalog-atomic snapshot-update idempotency ledger entries. */
   public static final String COMMIT_IDEMPOTENCY_ENTRY_PREFIX = "commit.idempotency.entry.";
 
-  public static final String COMMIT_IDEMPOTENCY_MAX_ENTRIES =
-      "commit.idempotency.max-entries";
+  public static final String COMMIT_IDEMPOTENCY_MAX_ENTRIES = "commit.idempotency.max-entries";
   public static final int COMMIT_IDEMPOTENCY_MAX_ENTRIES_DEFAULT = 10_000;
 
-  public static final String COMMIT_IDEMPOTENCY_RETENTION_MS =
-      "commit.idempotency.retention-ms";
+  public static final String COMMIT_IDEMPOTENCY_RETENTION_MS = "commit.idempotency.retention-ms";
   public static final long COMMIT_IDEMPOTENCY_RETENTION_MS_DEFAULT = 7L * 24 * 60 * 60 * 1000;
+
+  /**
+   * Declares how long an external recovery system may rely on this table's idempotency ledger
+   * entries. When set, a commit whose ledger retention expires before this window elapses is warned
+   * about: the replacement pass would find committed task state but no commit proof.
+   */
+  public static final String COMMIT_IDEMPOTENCY_RECOVERY_WINDOW_MS =
+      "commit.idempotency.recovery-window-ms";
 
   public static final String COMMIT_NUM_STATUS_CHECKS = "commit.status-check.num-retries";
   public static final int COMMIT_NUM_STATUS_CHECKS_DEFAULT = 3;
