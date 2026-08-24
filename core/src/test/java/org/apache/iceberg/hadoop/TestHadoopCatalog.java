@@ -27,6 +27,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -677,5 +678,42 @@ public class TestHadoopCatalog extends HadoopTableTestBase {
         .isInstanceOf(AlreadyExistsException.class)
         .hasMessage("Table already exists: a.t1");
     assertThat(catalog.dropTable(identifier)).isTrue();
+  }
+
+  @Test
+  public void testIdempotencyLedgerPropertyRoundTrip() throws Exception {
+    // Mirrors CatalogTests.testIdempotencyLedgerPropertyRoundTrip for the HadoopCatalog leg:
+    // HadoopCatalog stores properties inside the metadata JSON, so the ledger survives as long as
+    // the value itself round-trips byte-for-byte, including URL-safe Base64 characters.
+    String boundaryValue = "a-b_c0-_".repeat(512);
+    TableIdentifier identifier = TableIdentifier.of("db", "ledger-tbl");
+    HadoopCatalog catalog = hadoopCatalog();
+    try {
+      Table table = catalog.buildTable(identifier, SCHEMA).create();
+      table
+          .newAppend()
+          .appendFile(FILE_A)
+          .idempotencyKey("test.logical-write-id", boundaryValue)
+          .commit();
+      long firstSnapshotID = table.currentSnapshot().snapshotId();
+
+      Table reloaded = catalog.loadTable(identifier);
+      assertThat(
+              reloaded.properties().keySet().stream()
+                  .filter(key -> key.startsWith(TableProperties.COMMIT_IDEMPOTENCY_ENTRY_PREFIX))
+                  .collect(Collectors.toList()))
+          .as("the ledger entry must survive a full metadata round trip through the catalog")
+          .hasSize(1);
+
+      reloaded
+          .newAppend()
+          .appendFile(FILE_B)
+          .idempotencyKey("test.logical-write-id", boundaryValue)
+          .commit();
+      assertThat(reloaded.currentSnapshot().snapshotId()).isEqualTo(firstSnapshotID);
+      assertThat(reloaded.snapshots()).hasSize(1);
+    } finally {
+      catalog.dropTable(identifier);
+    }
   }
 }

@@ -29,6 +29,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -839,6 +840,49 @@ public abstract class CatalogTests<C extends Catalog & SupportsNamespaces> {
         .containsEntry("override-key3", "catalog-override-key3")
         .containsEntry("override-key4", "catalog-override-key4")
         .containsEntry("prop1", "val1");
+
+    assertThat(catalog.dropTable(TBL)).as("Should successfully drop table").isTrue();
+  }
+
+  @Test
+  public void testIdempotencyLedgerPropertyRoundTrip() {
+    C catalog = catalog();
+
+    if (requiresNamespaceCreate()) {
+      catalog.createNamespace(TBL.namespace());
+    }
+
+    // Exactly MAX_IDEMPOTENCY_FIELD_BYTES (4096) characters of the URL-safe Base64 alphabet,
+    // including '-' and '_': any catalog that lowercases, trims or re-encodes property names/values
+    // breaks the digest lookup that makes a replacement driver's global commit idempotent.
+    String boundaryValue = "a-b_c0-_".repeat(512);
+    assertThat(boundaryValue.getBytes(StandardCharsets.UTF_8)).hasSize(4096);
+
+    Table table = catalog.buildTable(TBL, SCHEMA).create();
+    table
+        .newAppend()
+        .appendFile(FILE_A)
+        .idempotencyKey("test.logical-write-id", boundaryValue)
+        .commit();
+    long firstSnapshotID = table.currentSnapshot().snapshotId();
+
+    Table reloaded = catalog.loadTable(TBL);
+    assertThat(
+            reloaded.properties().keySet().stream()
+                .filter(key -> key.startsWith(TableProperties.COMMIT_IDEMPOTENCY_ENTRY_PREFIX))
+                .collect(Collectors.toList()))
+        .as("the ledger entry must survive a full metadata round trip through the catalog")
+        .hasSize(1);
+
+    // A replacement driver replays against reloaded metadata: the same key must resolve to the
+    // existing snapshot instead of publishing a second one.
+    reloaded
+        .newAppend()
+        .appendFile(FILE_B)
+        .idempotencyKey("test.logical-write-id", boundaryValue)
+        .commit();
+    assertThat(reloaded.currentSnapshot().snapshotId()).isEqualTo(firstSnapshotID);
+    assertThat(reloaded.snapshots()).hasSize(1);
 
     assertThat(catalog.dropTable(TBL)).as("Should successfully drop table").isTrue();
   }
