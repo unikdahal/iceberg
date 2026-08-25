@@ -41,11 +41,13 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.RecoveryPins;
 import org.apache.spark.sql.connector.write.BatchWriteRecoveryState;
 import org.apache.spark.sql.connector.write.DataWriter;
 import org.apache.spark.sql.connector.write.RecoveryDataWriter;
@@ -442,6 +444,32 @@ public class TestSparkWriteRecovery {
     Constructor<?> constructor = impl.getDeclaredConstructor(DataWriter.class, FileIO.class);
     constructor.setAccessible(true);
     return (RecoveryDataWriter) constructor.newInstance(mock(DataWriter.class), io);
+  }
+
+
+  @Test
+  public void beforeRecoveryAnchorPinsSelectedSnapshotDeterministically() {
+    table.newAppend().appendFile(taskCommit("pin-target.parquet", 5L).files()[0]).commit();
+    long snapshotId = table.currentSnapshot().snapshotId();
+    SparkTable sparkTable = new SparkTable(table);
+
+    sparkTable.beforeRecoveryAnchor("execution-identity-1");
+    String pinName = RecoveryPins.pinName("execution-identity-1", sparkTable.recoverySourceId());
+
+    org.apache.iceberg.SnapshotRef ref = table.refs().get(pinName);
+    assertThat(ref).as("the deterministic recovery pin must exist").isNotNull();
+    assertThat(ref.snapshotId()).isEqualTo(snapshotId);
+    assertThat(ref.maxRefAgeMs())
+        .isEqualTo(TableProperties.RECOVERY_SNAPSHOT_PIN_MAX_REF_AGE_MS_DEFAULT);
+
+    // Idempotent and immovable: re-pinning the same execution must not move or drop it.
+    sparkTable.beforeRecoveryAnchor("execution-identity-1");
+    assertThat(table.refs().get(pinName).snapshotId()).isEqualTo(snapshotId);
+
+    // A different execution derives a different, independent pin.
+    sparkTable.beforeRecoveryAnchor("execution-identity-2");
+    assertThat(table.refs())
+        .containsKey(RecoveryPins.pinName("execution-identity-2", sparkTable.recoverySourceId()));
   }
 
   private DataFile dataFile(Path path, long records) {

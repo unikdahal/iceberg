@@ -32,6 +32,7 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotRef;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.exceptions.ValidationException;
@@ -58,6 +59,7 @@ import org.apache.iceberg.spark.TimeTravel;
 import org.apache.iceberg.spark.TimeTravel.AsOfTimestamp;
 import org.apache.iceberg.spark.TimeTravel.AsOfVersion;
 import org.apache.iceberg.util.PropertyUtil;
+import org.apache.iceberg.util.RecoveryPins;
 import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.spark.sql.connector.catalog.SupportsDeleteV2;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
@@ -196,6 +198,25 @@ public class SparkTable extends BaseSparkTable
     }
 
     return String.format("v1:empty:schema:%d", schema.schemaId());
+  }
+
+  @Override
+  public void beforeRecoveryAnchor(String recoveryExecutionId) {
+    // The anchor names a snapshot that ordinary expiration is free to remove; the pin is what
+    // makes a replacement driver's identical selection survivable while its driver is down.
+    if (snapshot != null) {
+      long maxRefAgeMs =
+          PropertyUtil.propertyAsLong(
+              properties(),
+              TableProperties.RECOVERY_SNAPSHOT_PIN_MAX_REF_AGE_MS,
+              TableProperties.RECOVERY_SNAPSHOT_PIN_MAX_REF_AGE_MS_DEFAULT);
+      RecoveryPins.pin(
+          table(),
+          recoveryExecutionId,
+          recoverySourceId(),
+          snapshot.snapshotId(),
+          maxRefAgeMs);
+    }
   }
 
   @Override

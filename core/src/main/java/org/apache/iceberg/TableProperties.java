@@ -109,11 +109,17 @@ public class TableProperties {
 
   /**
    * Declares how long an external recovery system may rely on this table's idempotency ledger
-   * entries. When set, a commit whose ledger retention expires before this window elapses is warned
-   * about: the replacement pass would find committed task state but no commit proof.
+   * entries. When set, a commit whose ledger retention expires before this window elapses is
+   * warned about: the replacement pass would find committed task state but no commit proof.
    */
   public static final String COMMIT_IDEMPOTENCY_RECOVERY_WINDOW_MS =
       "commit.idempotency.recovery-window-ms";
+
+  /** How long a recovery snapshot pin may live; must exceed the recovery window it protects. */
+  public static final String RECOVERY_SNAPSHOT_PIN_MAX_REF_AGE_MS =
+      "recovery.snapshot-pin.max-ref-age-ms";
+  public static final long RECOVERY_SNAPSHOT_PIN_MAX_REF_AGE_MS_DEFAULT =
+      7L * 24 * 60 * 60 * 1000;
 
   public static final String COMMIT_NUM_STATUS_CHECKS = "commit.status-check.num-retries";
   public static final int COMMIT_NUM_STATUS_CHECKS_DEFAULT = 3;
